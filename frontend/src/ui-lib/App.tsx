@@ -7152,6 +7152,23 @@ export default function App({
     }
   }, [view, currentUser]);
 
+  // TC-05: Pertahankan heartbeat sesi saat mahasiswa berada di ruang ujian (view === "exam")
+  useEffect(() => {
+    if (view !== "exam" || !currentUser) return;
+    const id =
+      currentUser?.detail?.nim ||
+      currentUser?.profile?.nim ||
+      currentUser?.username ||
+      "";
+    if (!id) return;
+    const examId = activeExamSession?.id_ujian || null;
+    sendAuthHeartbeatApi(id, examId);
+    const hbTimer = window.setInterval(() => {
+      sendAuthHeartbeatApi(id, examId);
+    }, 10000);
+    return () => window.clearInterval(hbTimer);
+  }, [view, currentUser, activeExamSession]);
+
   const loginSuccess = (user?: any) => {
     if (user) {
       setCurrentUser(user);

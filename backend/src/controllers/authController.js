@@ -88,6 +88,8 @@ const DEMO_USERS = [
   }
 ];
 
+const HEARTBEAT_TTL_MS = 60 * 1000; // 60 detik batas aktif heartbeat lintas instance serverless
+
 function extractSessionKey(user, profile, identifier) {
   return String(
     profile?.nim ||
@@ -95,6 +97,30 @@ function extractSessionKey(user, profile, identifier) {
       user?.username ||
       identifier
   ).trim();
+}
+
+function parseDbSession(raw) {
+  if (!raw) return null;
+  const str = String(raw).trim();
+  if (!str) return null;
+  const pipeIdx = str.lastIndexOf('|');
+  if (pipeIdx > 0) {
+    const deviceId = str.slice(0, pipeIdx).trim();
+    const ts = Number(str.slice(pipeIdx + 1));
+    if (deviceId && !Number.isNaN(ts) && ts > 0) {
+      return { device_id: deviceId, last_heartbeat: ts };
+    }
+  }
+  return { device_id: str, last_heartbeat: Date.now() };
+}
+
+function encodeDbSession(deviceId, timestamp = Date.now()) {
+  return `${String(deviceId).trim()}|${timestamp}`;
+}
+
+function isDbSessionAlive(parsed) {
+  if (!parsed || !parsed.device_id) return false;
+  return Date.now() - Number(parsed.last_heartbeat) <= HEARTBEAT_TTL_MS;
 }
 
 exports.login = async (req, res) => {
@@ -223,9 +249,25 @@ exports.login = async (req, res) => {
       }
     }
 
-    // TC-05 / BR-01: STRICT SINGLE-DEVICE LOGIN LOCK
+    // TC-05 / BR-01: STRICT SINGLE-DEVICE LOGIN LOCK (Terpusat di Database + SessionStore)
     // Periksa apakah akun sedang aktif di perangkat/browser lain (heartbeat aktif dalam 60 detik terakhir)
     const sessionKey = extractSessionKey(user, profile, identifier);
+
+    // 1. Cek kunci sesi terpusat di Database (lintas instance serverless Vercel)
+    if (usingDb && user.active_session_id) {
+      const dbSession = parseDbSession(user.active_session_id);
+      if (isDbSessionAlive(dbSession) && dbSession.device_id !== cleanDeviceId) {
+        return res.status(409).json({
+          success: false,
+          multi_device_blocked: true,
+          code: 'MULTI_DEVICE_LOGIN_BLOCKED',
+          message:
+            'Akses Ditolak (TC-05): Akun ini sedang aktif digunakan pada perangkat/browser lain. Silakan logout terlebih dahulu dari perangkat pertama.'
+        });
+      }
+    }
+
+    // 2. Cek fallback di in-memory sessionStore (untuk mode lokal / offline DB)
     const existingSession =
       sessionStore.getActiveUserSession(sessionKey) ||
       sessionStore.getActiveUserSession(user.username) ||
@@ -244,7 +286,7 @@ exports.login = async (req, res) => {
     if (usingDb) {
       try {
         await pool.query('UPDATE pengguna SET active_session_id = ? WHERE id_pengguna = ?', [
-          cleanDeviceId,
+          encodeDbSession(cleanDeviceId, Date.now()),
           user.id_pengguna
         ]);
       } catch {
@@ -313,6 +355,41 @@ exports.heartbeat = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Identifier pengguna wajib disertakan.' });
     }
 
+    // Perbarui heartbeat di Database terpusat (wajib untuk lingkungan serverless seperti Vercel)
+    let dbActive = false;
+    try {
+      const [rows] = await pool.query(
+        `SELECT DISTINCT p.id_pengguna, p.active_session_id
+         FROM pengguna p
+         LEFT JOIN mahasiswa m ON p.id_pengguna = m.id_pengguna
+         LEFT JOIN dosen d ON p.id_pengguna = d.id_pengguna
+         WHERE p.username = ? OR m.nim = ? OR d.nip = ?
+         LIMIT 1`,
+        [identifier, identifier, identifier]
+      );
+
+      if (rows.length > 0) {
+        const row = rows[0];
+        const dbSession = parseDbSession(row.active_session_id);
+        if (dbSession && isDbSessionAlive(dbSession) && cleanDeviceId && dbSession.device_id !== cleanDeviceId) {
+          return res.status(409).json({
+            success: false,
+            multi_device_blocked: true,
+            message: 'Sesi Anda telah diambil alih atau tidak valid di perangkat ini.'
+          });
+        }
+        if (cleanDeviceId) {
+          await pool.query('UPDATE pengguna SET active_session_id = ? WHERE id_pengguna = ?', [
+            encodeDbSession(cleanDeviceId, Date.now()),
+            row.id_pengguna
+          ]);
+          dbActive = true;
+        }
+      }
+    } catch {
+      // Abaikan jika MySQL offline, lanjutkan dengan sessionStore lokal
+    }
+
     const touched = sessionStore.touchHeartbeat(identifier, cleanDeviceId, active_exam_id);
     if (touched && touched.conflict) {
       return res.status(409).json({
@@ -324,7 +401,7 @@ exports.heartbeat = async (req, res) => {
 
     return res.status(200).json({
       success: true,
-      active: Boolean(touched),
+      active: Boolean(dbActive || touched),
       server_time: Date.now()
     });
   } catch (error) {
@@ -342,14 +419,34 @@ exports.logout = async (req, res) => {
       sessionStore.clearUserSession(identifier, cleanDeviceId || undefined);
     }
 
-    if (req.user && req.user.id_pengguna) {
-      try {
+    // Lepaskan kunci sesi di Database terpusat (baik via req.user maupun via identifier + device_id)
+    try {
+      if (req.user && req.user.id_pengguna) {
         await pool.query('UPDATE pengguna SET active_session_id = NULL WHERE id_pengguna = ?', [
           req.user.id_pengguna
         ]);
-      } catch {
-        // Abaikan jika MySQL offline
+      } else if (identifier) {
+        const [rows] = await pool.query(
+          `SELECT DISTINCT p.id_pengguna, p.active_session_id
+           FROM pengguna p
+           LEFT JOIN mahasiswa m ON p.id_pengguna = m.id_pengguna
+           LEFT JOIN dosen d ON p.id_pengguna = d.id_pengguna
+           WHERE p.username = ? OR m.nim = ? OR d.nip = ?
+           LIMIT 1`,
+          [identifier, identifier, identifier]
+        );
+        if (rows.length > 0) {
+          const row = rows[0];
+          const dbSession = parseDbSession(row.active_session_id);
+          if (!cleanDeviceId || !dbSession || dbSession.device_id === cleanDeviceId) {
+            await pool.query('UPDATE pengguna SET active_session_id = NULL WHERE id_pengguna = ?', [
+              row.id_pengguna
+            ]);
+          }
+        }
       }
+    } catch {
+      // Abaikan jika MySQL offline
     }
 
     return res.status(200).json({
@@ -398,9 +495,37 @@ exports.resetUserSession = async (req, res) => {
 
 exports.getActiveSessions = async (req, res) => {
   try {
+    let sessions = [];
+    try {
+      const [rows] = await pool.query(
+        `SELECT p.id_pengguna, p.username, p.role, p.active_session_id,
+                m.nim, m.nama AS nama_mahasiswa, d.nip, d.nama_dosen
+         FROM pengguna p
+         LEFT JOIN mahasiswa m ON p.id_pengguna = m.id_pengguna
+         LEFT JOIN dosen d ON p.id_pengguna = d.id_pengguna
+         WHERE p.active_session_id IS NOT NULL`
+      );
+      for (const r of rows) {
+        const parsed = parseDbSession(r.active_session_id);
+        if (isDbSessionAlive(parsed)) {
+          sessions.push({
+            nim: r.nim || r.nip || r.username,
+            user_id: r.id_pengguna,
+            username: r.username,
+            role: r.role,
+            nama: r.nama_mahasiswa || r.nama_dosen || r.username,
+            device_id: parsed.device_id,
+            last_heartbeat: parsed.last_heartbeat
+          });
+        }
+      }
+    } catch {
+      sessions = sessionStore.listActiveSessions();
+    }
+
     return res.status(200).json({
       success: true,
-      sessions: sessionStore.listActiveSessions()
+      sessions
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: 'Gagal memuat daftar sesi aktif.' });

@@ -65,7 +65,8 @@ async function verifyToken(req, res, next) {
     }
 
     // Single-Session Validation (BR-01): cegah login ganda
-    if (decoded.session_id && user.active_session_id && user.active_session_id !== decoded.session_id) {
+    const dbDeviceId = user.active_session_id ? String(user.active_session_id).split('|')[0].trim() : null;
+    if (decoded.session_id && dbDeviceId && dbDeviceId !== decoded.session_id) {
       return res.status(401).json({
         success: false,
         message: 'Sesi Anda telah berakhir karena akun ini login di perangkat lain.'
